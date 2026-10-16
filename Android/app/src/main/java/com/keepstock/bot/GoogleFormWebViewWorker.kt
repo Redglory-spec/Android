@@ -66,9 +66,8 @@ class GoogleFormAutomationCoordinator(
         ws.javaScriptEnabled = true
         ws.domStorageEnabled = true
         ws.databaseEnabled = true
-        ws.loadsImagesAutomatically = false // Percepat loading form dengan tidak memuat gambar dekorasi
+        ws.loadsImagesAutomatically = true
         ws.cacheMode = WebSettings.LOAD_DEFAULT
-        // Gunakan User-Agent Desktop Chrome agar DOM & XPath Google Form identik 100% dengan versi PC
         ws.userAgentString =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -114,7 +113,7 @@ class GoogleFormAutomationCoordinator(
         val failedRows = Collections.synchronizedList(ArrayList<Int>())
         val startTimeMs = System.currentTimeMillis()
 
-        val modeTeks = if (headlessMode) "Background/Headless" else "Tampil WebView"
+        val modeTeks = if (headlessMode) "Background/Headless" else "Tampil Layar"
         onLog(
             "Menyiapkan $actualWorkers WebView [$modeTeks] | Target: $totalTarget baris | Maks Retry: ${maxRetry}x...",
             "INFO"
@@ -244,6 +243,7 @@ class GoogleFormAutomationCoordinator(
             }
 
             if (needInitialLoad) {
+                onLog("${wPrefix}Membuka link Google Form baris $currentRowNumber...", "INFO")
                 webView.loadUrl(linkForm)
             }
 
@@ -255,8 +255,8 @@ class GoogleFormAutomationCoordinator(
                 onWorkerDone()
                 return
             }
-            if (System.currentTimeMillis() - stepStartMs > 18000L) {
-                handleAttemptError("Timeout menunggu halaman 1 (Identitas PIC) terbuka.")
+            if (System.currentTimeMillis() - stepStartMs > 25000L) {
+                handleAttemptError("Timeout menunggu form terbuka (Koneksi lambat atau link tidak merespon).")
                 return
             }
 
@@ -266,17 +266,15 @@ class GoogleFormAutomationCoordinator(
             val jsLayer1 = """
                 (function() {
                     function byXPath(xp) {
-                        return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                    }
-                    function isVisible(el) {
-                        if (!el) return false;
-                        var r = el.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0;
+                        try {
+                            return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                        } catch(e) { return null; }
                     }
                     function setInputValue(el, val) {
+                        if (!el) return;
                         el.focus();
                         var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                        if (setter) setter.call(el, val); else el.value = val;
+                        if (setter) { setter.call(el, val); } else { el.value = val; }
                         el.dispatchEvent(new Event('input', { bubbles: true }));
                         el.dispatchEvent(new Event('change', { bubbles: true }));
                         el.dispatchEvent(new Event('blur', { bubbles: true }));
@@ -284,15 +282,17 @@ class GoogleFormAutomationCoordinator(
                     function fullClick(el) {
                         if (!el) return;
                         ['mousedown', 'mouseup', 'click'].forEach(function(evtType) {
-                            el.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
+                            try {
+                                el.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
+                            } catch(e) { el.click(); }
                         });
                     }
 
-                    var inpNama = byXPath('(//input[@type="text"])[1]');
-                    var ddPosisi = byXPath("(//div[@role='listbox'])[1]");
-                    var btnNext = byXPath("//span[text()='Berikutnya' or text()='Next']");
+                    var inputs = document.querySelectorAll('input[type="text"], input:not([type])');
+                    var inpNama = inputs.length > 0 ? inputs[0] : byXPath('(//input[@type="text"])[1]');
+                    var ddPosisi = document.querySelector('div[role="listbox"]') || byXPath("(//div[@role='listbox'])[1]");
 
-                    if (!isVisible(inpNama) || !isVisible(ddPosisi) || !isVisible(btnNext)) {
+                    if (!inpNama || !ddPosisi) {
                         return 'WAIT_PAGE1';
                     }
 
@@ -300,8 +300,11 @@ class GoogleFormAutomationCoordinator(
                         setInputValue(inpNama, $escapedNama);
                     }
 
-                    var optPosisi = byXPath("//div[@role='option']//span[text()=" + $escapedPosisi + "]");
-                    if (!isVisible(optPosisi)) {
+                    // Cari opsi posisi di dropdown
+                    var optPosisi = byXPath("//div[@role='option']//span[text()=" + $escapedPosisi + "]") ||
+                                    byXPath("//div[@role='option'][contains(., " + $escapedPosisi + ")]");
+
+                    if (!optPosisi) {
                         fullClick(ddPosisi);
                         return 'OPENING_DROPDOWN';
                     }
@@ -316,10 +319,14 @@ class GoogleFormAutomationCoordinator(
                 val res = rawRes?.trim('"', ' ') ?: ""
                 when (res) {
                     "POSISI_CLICKED" -> {
-                        mainHandler.postDelayed({ clickNextButton(System.currentTimeMillis()) }, 180)
+                        onLog("${wPrefix}Identitas PIC ($namaIdentitas - $posisiIdentitas) terisi. Lanjut ke halaman 2...", "INFO")
+                        mainHandler.postDelayed({ clickNextButton(System.currentTimeMillis()) }, 200)
+                    }
+                    "OPENING_DROPDOWN" -> {
+                        mainHandler.postDelayed({ waitForLayer1AndFill(stepStartMs) }, 200)
                     }
                     else -> {
-                        mainHandler.postDelayed({ waitForLayer1AndFill(stepStartMs) }, 140)
+                        mainHandler.postDelayed({ waitForLayer1AndFill(stepStartMs) }, 180)
                     }
                 }
             }
@@ -330,7 +337,7 @@ class GoogleFormAutomationCoordinator(
                 onWorkerDone()
                 return
             }
-            if (System.currentTimeMillis() - stepStartMs > 10000L) {
+            if (System.currentTimeMillis() - stepStartMs > 12000L) {
                 handleAttemptError("Timeout menekan tombol Berikutnya.")
                 return
             }
@@ -338,14 +345,24 @@ class GoogleFormAutomationCoordinator(
             val jsClickNext = """
                 (function() {
                     function byXPath(xp) {
-                        return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                        try {
+                            return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                        } catch(e) { return null; }
                     }
-                    var spanNext = byXPath("//span[text()='Berikutnya' or text()='Next']");
+                    function fullClick(el) {
+                        if (!el) return;
+                        ['mousedown', 'mouseup', 'click'].forEach(function(evtType) {
+                            try {
+                                el.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
+                            } catch(e) { el.click(); }
+                        });
+                    }
+
+                    var spanNext = byXPath("//span[text()='Berikutnya' or text()='Next']") ||
+                                   byXPath("//div[@role='button']//span[contains(text(),'Berikutnya') or contains(text(),'Next')]");
                     if (!spanNext) return 'WAIT';
                     var btn = spanNext.closest("div[role='button']") || spanNext;
-                    ['mousedown', 'mouseup', 'click'].forEach(function(evtType) {
-                        btn.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
-                    });
+                    fullClick(btn);
                     return 'CLICKED_NEXT';
                 })();
             """.trimIndent()
@@ -355,9 +372,9 @@ class GoogleFormAutomationCoordinator(
                 if (res == "CLICKED_NEXT") {
                     val doneSoFar = completedCount.get()
                     onProgressChange(doneSoFar * 2 + 1, targetIndices.size * 2)
-                    mainHandler.postDelayed({ waitForLayer2AndSubmit(System.currentTimeMillis()) }, 180)
+                    mainHandler.postDelayed({ waitForLayer2AndSubmit(System.currentTimeMillis()) }, 250)
                 } else {
-                    mainHandler.postDelayed({ clickNextButton(stepStartMs) }, 140)
+                    mainHandler.postDelayed({ clickNextButton(stepStartMs) }, 180)
                 }
             }
         }
@@ -367,8 +384,8 @@ class GoogleFormAutomationCoordinator(
                 onWorkerDone()
                 return
             }
-            if (System.currentTimeMillis() - stepStartMs > 18000L) {
-                handleAttemptError("Timeout menunggu halaman 2 (4 Kolom Stok) terbuka.")
+            if (System.currentTimeMillis() - stepStartMs > 25000L) {
+                handleAttemptError("Timeout menunggu halaman 2 (4 Kolom Stok) muncul.")
                 return
             }
 
@@ -381,41 +398,43 @@ class GoogleFormAutomationCoordinator(
             val jsLayer2 = """
                 (function() {
                     function byXPath(xp) {
-                        return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                    }
-                    function isVisible(el) {
-                        if (!el) return false;
-                        var r = el.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0;
+                        try {
+                            return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                        } catch(e) { return null; }
                     }
                     function setInputValue(el, val) {
+                        if (!el) return;
                         el.focus();
                         var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                        if (setter) setter.call(el, val); else el.value = val;
+                        if (setter) { setter.call(el, val); } else { el.value = val; }
                         el.dispatchEvent(new Event('input', { bubbles: true }));
                         el.dispatchEvent(new Event('change', { bubbles: true }));
                         el.dispatchEvent(new Event('blur', { bubbles: true }));
                     }
+                    function fullClick(el) {
+                        if (!el) return;
+                        ['mousedown', 'mouseup', 'click'].forEach(function(evtType) {
+                            try {
+                                el.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
+                            } catch(e) { el.click(); }
+                        });
+                    }
 
-                    var i1 = byXPath('(//input[@type="text"])[1]');
-                    var i2 = byXPath('(//input[@type="text"])[2]');
-                    var i3 = byXPath('(//input[@type="text"])[3]');
-                    var i4 = byXPath('(//input[@type="text"])[4]');
-                    var spanKirim = byXPath("//span[text()='Kirim' or text()='Submit']");
+                    var inputs = document.querySelectorAll('input[type="text"], input:not([type])');
+                    var spanKirim = byXPath("//span[text()='Kirim' or text()='Submit']") ||
+                                    byXPath("//div[@role='button']//span[contains(text(),'Kirim') or contains(text(),'Submit')]");
 
-                    if (!isVisible(i1) || !isVisible(i2) || !isVisible(i3) || !isVisible(i4) || !isVisible(spanKirim)) {
+                    if (inputs.length < 4 || !spanKirim) {
                         return 'WAIT_PAGE2';
                     }
 
-                    setInputValue(i1, $vKeep);
-                    setInputValue(i2, $vSku);
-                    setInputValue(i3, $vQty);
-                    setInputValue(i4, $vGon);
+                    setInputValue(inputs[0], $vKeep);
+                    setInputValue(inputs[1], $vSku);
+                    setInputValue(inputs[2], $vQty);
+                    setInputValue(inputs[3], $vGon);
 
                     var btnSubmit = spanKirim.closest("div[role='button']") || spanKirim;
-                    ['mousedown', 'mouseup', 'click'].forEach(function(evtType) {
-                        btnSubmit.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
-                    });
+                    fullClick(btnSubmit);
                     return 'SUBMITTED';
                 })();
             """.trimIndent()
@@ -423,9 +442,10 @@ class GoogleFormAutomationCoordinator(
             webView.evaluateJavascript(jsLayer2) { rawRes ->
                 val res = rawRes?.trim('"', ' ') ?: ""
                 if (res == "SUBMITTED") {
-                    mainHandler.postDelayed({ waitForSubmitConfirm(System.currentTimeMillis()) }, 180)
+                    onLog("${wPrefix}Data stok terisi (SKU: ${DataValidator.bersihkanAngka(row.sku)}). Mengirim formulir...", "INFO")
+                    mainHandler.postDelayed({ waitForSubmitConfirm(System.currentTimeMillis()) }, 250)
                 } else {
-                    mainHandler.postDelayed({ waitForLayer2AndSubmit(stepStartMs) }, 140)
+                    mainHandler.postDelayed({ waitForLayer2AndSubmit(stepStartMs) }, 180)
                 }
             }
         }
@@ -435,7 +455,7 @@ class GoogleFormAutomationCoordinator(
                 onWorkerDone()
                 return
             }
-            if (System.currentTimeMillis() - stepStartMs > 18000L) {
+            if (System.currentTimeMillis() - stepStartMs > 25000L) {
                 handleAttemptError("Timeout menunggu konfirmasi pengiriman form.")
                 return
             }
@@ -443,15 +463,23 @@ class GoogleFormAutomationCoordinator(
             val jsCheckDone = """
                 (function() {
                     function byXPath(xp) {
-                        return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                        try {
+                            return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                        } catch(e) { return null; }
                     }
-                    var linkAgain = byXPath("//a[contains(@href, 'viewform') or contains(@href, 'form_confirm')]");
+                    var linkAgain = byXPath("//a[contains(@href, 'viewform') or contains(@href, 'form_confirm') or contains(@href, 'formResponse')]");
                     if (linkAgain) {
                         linkAgain.click();
                         return 'DONE_CLICKED_AGAIN';
                     }
+                    var bodyText = document.body ? document.body.innerText : '';
+                    if (bodyText.indexOf('Jawaban Anda telah direkam') !== -1 ||
+                        bodyText.indexOf('telah direkam') !== -1 ||
+                        bodyText.indexOf('response has been recorded') !== -1) {
+                        return 'DONE_CONFIRMED';
+                    }
                     var spanKirim = byXPath("//span[text()='Kirim' or text()='Submit']");
-                    if (!spanKirim) {
+                    if (!spanKirim && bodyText.length > 50) {
                         return 'DONE_NO_SUBMIT_BTN';
                     }
                     return 'WAIT_CONFIRM';
@@ -460,17 +488,17 @@ class GoogleFormAutomationCoordinator(
 
             webView.evaluateJavascript(jsCheckDone) { rawRes ->
                 val res = rawRes?.trim('"', ' ') ?: ""
-                when (res) {
-                    "DONE_CLICKED_AGAIN" -> {
+                when {
+                    res == "DONE_CLICKED_AGAIN" -> {
                         needInitialLoad = false
                         markRowSuccess()
                     }
-                    "DONE_NO_SUBMIT_BTN" -> {
+                    res == "DONE_CONFIRMED" || res == "DONE_NO_SUBMIT_BTN" -> {
                         needInitialLoad = true
                         markRowSuccess()
                     }
                     else -> {
-                        mainHandler.postDelayed({ waitForSubmitConfirm(stepStartMs) }, 140)
+                        mainHandler.postDelayed({ waitForSubmitConfirm(stepStartMs) }, 200)
                     }
                 }
             }
@@ -505,11 +533,11 @@ class GoogleFormAutomationCoordinator(
 
             val row = rows[currentIndex]
             onLog(
-                "${wPrefix}Baris $currentRowNumber/${rows.size} BERHASIL -> SKU: ${DataValidator.bersihkanAngka(row.sku)} | QTY: ${DataValidator.bersihkanAngka(row.skuQty)} ($durStr)",
+                "${wPrefix}Baris $currentRowNumber/${rows.size} SUKSES -> SKU: ${DataValidator.bersihkanAngka(row.sku)} | QTY: ${DataValidator.bersihkanAngka(row.skuQty)} ($durStr)",
                 "SUKSES"
             )
 
-            mainHandler.postDelayed({ processNextRow() }, 80)
+            mainHandler.postDelayed({ processNextRow() }, 100)
         }
 
         private fun handleAttemptError(reason: String) {
@@ -523,7 +551,7 @@ class GoogleFormAutomationCoordinator(
             if (currentAttempt < maxRetry) {
                 currentAttempt++
                 needInitialLoad = true
-                mainHandler.postDelayed({ startAttempt() }, 900)
+                mainHandler.postDelayed({ startAttempt() }, 1000)
             } else {
                 val doneNow = completedCount.incrementAndGet()
                 failedRows.add(currentIndex)

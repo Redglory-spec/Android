@@ -489,7 +489,7 @@ class MainActivity : Activity() {
             isChecked = true
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setOnCheckedChangeListener { _, isChecked ->
-                webViewWrapper.visibility = if (isChecked) View.GONE else View.VISIBLE
+                updateWebViewWrapperVisibility(isChecked)
             }
         }
         primaryLabels.add(chkHeadless)
@@ -533,14 +533,14 @@ class MainActivity : Activity() {
         card3.addView(tvEta)
         card3.addView(progressBar)
 
-        // Wadah WebView Live (Tampil jika Headless tidak dicentang, tetap aktif di memori saat Headless)
+        // Wadah WebView Live (Tetap aktif ter-render di memori meskipun Headless)
         webViewWrapper = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8) }
+                dp(1)
+            )
+            alpha = 0.01f
         }
         val tvWebPreviewTitle = createSmallLabel("🌐 Tampilan Live Google Form (WebView):")
         webViewContainer = LinearLayout(this).apply {
@@ -1203,7 +1203,23 @@ class MainActivity : Activity() {
         spinWorker.setSelection((prefs.jumlahWorker - 1).coerceIn(0, 3))
         entRetry.setText(prefs.maxRetry.toString())
         chkHeadless.isChecked = prefs.headless
-        webViewWrapper.visibility = if (prefs.headless) View.GONE else View.VISIBLE
+        updateWebViewWrapperVisibility(prefs.headless)
+    }
+
+    private fun updateWebViewWrapperVisibility(headless: Boolean) {
+        if (headless) {
+            webViewWrapper.layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(1)
+            ).apply { topMargin = 0 }
+            webViewWrapper.alpha = 0.01f
+        } else {
+            webViewWrapper.layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+            webViewWrapper.alpha = 1.0f
+        }
     }
 
     private fun saveCurrentPrefs() {
