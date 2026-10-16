@@ -21,30 +21,21 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Setup Gradle
+      - name: Setup Gradle 8.6
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.6'
 
       - name: Build Debug & Release APK
+        working-directory: Android
         run: |
-          if [ -f "Android/settings.gradle.kts" ]; then
-            cd Android
-          fi
-          gradle assembleDebug assembleRelease --no-daemon
+          gradle assembleDebug assembleRelease --no-daemon --stacktrace
 
       - name: Copy & Rename APK
         run: |
           mkdir -p dist-apk
-          BASE_DIR="."
-          if [ -d "Android/app" ]; then
-            BASE_DIR="Android"
-          fi
-          cp "$BASE_DIR/app/build/outputs/apk/debug/app-debug.apk" "dist-apk/BotKeepStock-v6.1-Debug.apk"
-          cp "$BASE_DIR/app/build/outputs/apk/release/app-release.apk" "dist-apk/BotKeepStock-v6.1-Release.apk"
+          cp Android/app/build/outputs/apk/debug/app-debug.apk dist-apk/BotKeepStock-v6.1-Debug.apk
+          cp Android/app/build/outputs/apk/release/app-release.apk dist-apk/BotKeepStock-v6.1-Release.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4

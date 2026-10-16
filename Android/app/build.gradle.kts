@@ -17,12 +17,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = true
-            isShrinkResources = true
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+            isMinifyEnabled = false
+            isShrinkResources = false
             signingConfig = signingConfigs.getByName("debug")
         }
         debug {
@@ -41,5 +37,4 @@ android {
 }
 
 dependencies {
-    // Zero heavy external dependencies! Pure Android SDK untuk ukuran APK super kecil (~1.5 MB)
 }
