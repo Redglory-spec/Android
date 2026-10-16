@@ -2,11 +2,14 @@ package com.keepstock.bot
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -52,13 +55,15 @@ class GoogleFormAutomationCoordinator(
         }
     }
 
+    private fun dpToPx(dp: Int): Int {
+        val density = context.resources.displayMetrics.density
+        return (dp * density + 0.5f).toInt()
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
-    private fun createConfiguredWebView(workerId: Int): WebView {
+    private fun createConfiguredWebView(wPrefix: String): WebView {
         val wv = WebView(context)
-        val lp = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dpToPx(240)
-        )
+        val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dpToPx(320))
         lp.bottomMargin = dpToPx(6)
         wv.layoutParams = lp
 
@@ -74,17 +79,26 @@ class GoogleFormAutomationCoordinator(
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
-        wv.webViewClient = object : WebViewClient() {}
+        wv.webViewClient = object : WebViewClient() {
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                onLog("${wPrefix}Memuat halaman...", "INFO")
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                onLog("${wPrefix}Halaman selesai dimuat.", "INFO")
+            }
+
+            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                if (request?.isForMainFrame == true) {
+                    onLog("${wPrefix}Error jaringan: ${error?.description}", "ERROR")
+                }
+            }
+        }
         wv.webChromeClient = WebChromeClient()
 
         webViewContainer.addView(wv)
         activeWebViews.add(wv)
         return wv
-    }
-
-    private fun dpToPx(dp: Int): Int {
-        val density = context.resources.displayMetrics.density
-        return (dp * density + 0.5f).toInt()
     }
 
     fun startAutomation(
@@ -114,17 +128,23 @@ class GoogleFormAutomationCoordinator(
         val startTimeMs = System.currentTimeMillis()
 
         val modeTeks = if (headlessMode) "Background/Headless" else "Tampil Layar"
-        onLog(
-            "Menyiapkan $actualWorkers WebView [$modeTeks] | Target: $totalTarget baris | Maks Retry: ${maxRetry}x...",
-            "INFO"
-        )
+        onLog("Menyiapkan $actualWorkers WebView [$modeTeks] | Target: $totalTarget baris | Maks Retry: ${maxRetry}x...", "INFO")
         onProgressChange(0, totalTarget * 2)
         onEtaChange("Target: $totalTarget baris ($actualWorkers worker) | Estimasi: Menghitung...")
 
         mainHandler.post {
-            cleanupWebViews()
+            for (wv in activeWebViews) {
+                try {
+                    (wv.parent as? ViewGroup)?.removeView(wv)
+                    wv.destroy()
+                } catch (_: Exception) {
+                }
+            }
+            activeWebViews.clear()
+
             for (wId in 1..actualWorkers) {
-                val wv = createConfiguredWebView(wId)
+                val prefix = if (actualWorkers > 1) "[W$wId] " else ""
+                val wv = createConfiguredWebView(prefix)
                 val worker = SingleWebViewWorker(
                     workerId = wId,
                     totalWorkers = actualWorkers,
@@ -144,22 +164,22 @@ class GoogleFormAutomationCoordinator(
                 ) {
                     if (finishedWorkers.incrementAndGet() >= actualWorkers) {
                         isRunning.set(false)
-                        val sortedFailed = failedRows.toList().sorted()
                         onFinished(
-                            isStopped.get(),
-                            false,
-                            lastSuccessRow.get(),
-                            successCount.get(),
-                            totalData,
-                            sortedFailed,
-                            ""
+                            isStopped.get(), false, lastSuccessRow.get(), successCount.get(),
+                            totalData, failedRows.toList().sorted(), ""
                         )
                     }
                 }
-                mainHandler.postDelayed({ worker.processNextRow() }, ((wId - 1) * 300).toLong())
+                mainHandler.postDelayed({ worker.processNextRow() }, ((wId - 1) * 400).toLong())
             }
         }
     }
+
+    // =====================================================================
+    // WORKER BERBASIS STATE MACHINE + WATCHDOG
+    // (Tahan terhadap callback evaluateJavascript yang hilang saat navigasi)
+    // =====================================================================
+    private enum class Step { PAGE1, NEXT, PAGE2, CONFIRM }
 
     private inner class SingleWebViewWorker(
         private val workerId: Int,
@@ -181,334 +201,234 @@ class GoogleFormAutomationCoordinator(
     ) {
         private val wPrefix = if (totalWorkers > 1) "[W$workerId] " else ""
         private var needInitialLoad = true
+        private var finished = false
 
         private var currentIndex = -1
         private var currentRowNumber = 0
         private var currentAttempt = 1
         private var rowStartMs = 0L
 
-        fun processNextRow() {
-            if (isStopped.get()) {
-                onWorkerDone()
-                return
-            }
+        private var step = Step.PAGE1
+        private var stepStartMs = 0L
+        private var evalPending = false
+        private var evalSentAt = 0L
+        private var evalGeneration = 0
+        private var lastResult = ""
+        private var active = false
 
+        private val tickRunnable = Runnable { tick() }
+
+        private fun scheduleTick(delayMs: Long) {
+            mainHandler.removeCallbacks(tickRunnable)
+            mainHandler.postDelayed(tickRunnable, delayMs)
+        }
+
+        private fun finishWorker() {
+            if (finished) return
+            finished = true
+            active = false
+            mainHandler.removeCallbacks(tickRunnable)
+            onWorkerDone()
+        }
+
+        private fun goTo(newStep: Step) {
+            step = newStep
+            stepStartMs = System.currentTimeMillis()
+            evalPending = false
+            evalGeneration++
+            lastResult = ""
+        }
+
+        private fun stepTimeoutMs(): Long = when (step) {
+            Step.PAGE1 -> 30000L
+            Step.NEXT -> 15000L
+            Step.PAGE2 -> 30000L
+            Step.CONFIRM -> 30000L
+        }
+
+        fun processNextRow() {
+            if (isStopped.get()) { finishWorker(); return }
             if (isPaused.get()) {
                 onStatusChange("Dijeda. Ketuk 'LANJUT' untuk meneruskan...", 0xFFF59E0B.toInt())
-                mainHandler.postDelayed({ processNextRow() }, 250)
+                mainHandler.postDelayed({ processNextRow() }, 300)
                 return
             }
 
             val qPos = nextQueuePos.getAndIncrement()
-            if (qPos >= targetIndices.size) {
-                onWorkerDone()
-                return
-            }
+            if (qPos >= targetIndices.size) { finishWorker(); return }
 
             currentIndex = targetIndices[qPos]
             currentRowNumber = currentIndex + 1
             currentAttempt = 1
             rowStartMs = System.currentTimeMillis()
-
             startAttempt()
         }
 
         private fun startAttempt() {
-            if (isStopped.get()) {
-                onWorkerDone()
-                return
-            }
-            if (isPaused.get()) {
-                mainHandler.postDelayed({ startAttempt() }, 250)
-                return
-            }
+            if (isStopped.get()) { finishWorker(); return }
 
-            val row = rows[currentIndex]
-            val skuClean = DataValidator.bersihkanAngka(row.sku)
-
+            val skuClean = DataValidator.bersihkanAngka(rows[currentIndex].sku)
             if (currentAttempt > 1) {
                 onRowStatusChange(currentIndex, "${wPrefix}Retry $currentAttempt/$maxRetry...", true)
-                onStatusChange(
-                    "${wPrefix}Mencoba ulang baris $currentRowNumber ($currentAttempt/$maxRetry)...",
-                    0xFFF59E0B.toInt()
-                )
+                onStatusChange("${wPrefix}Mencoba ulang baris $currentRowNumber ($currentAttempt/$maxRetry)...", 0xFFF59E0B.toInt())
                 needInitialLoad = true
             } else {
-                val procLabel = if (totalWorkers > 1) "Memproses [W$workerId]..." else "Memproses..."
-                onRowStatusChange(currentIndex, procLabel, true)
-                onStatusChange(
-                    "${wPrefix}Memproses baris $currentRowNumber/${rows.size} (SKU: $skuClean)...",
-                    0xFF3B82F6.toInt()
-                )
+                onRowStatusChange(currentIndex, if (totalWorkers > 1) "Memproses [W$workerId]..." else "Memproses...", true)
+                onStatusChange("${wPrefix}Memproses baris $currentRowNumber/${rows.size} (SKU: $skuClean)...", 0xFF3B82F6.toInt())
             }
 
+            goTo(Step.PAGE1)
+            active = true
             if (needInitialLoad) {
                 onLog("${wPrefix}Membuka link Google Form baris $currentRowNumber...", "INFO")
                 webView.loadUrl(linkForm)
+                scheduleTick(900)
+            } else {
+                scheduleTick(300)
             }
-
-            waitForLayer1AndFill(System.currentTimeMillis())
         }
 
-        private fun waitForLayer1AndFill(stepStartMs: Long) {
-            if (isStopped.get()) {
-                onWorkerDone()
+        // Loop watchdog: berjalan terus setiap ±250ms terlepas dari callback JS
+        private fun tick() {
+            if (!active) return
+            if (isStopped.get()) { finishWorker(); return }
+            if (isPaused.get()) { scheduleTick(300); return }
+
+            val now = System.currentTimeMillis()
+
+            if (now - stepStartMs > stepTimeoutMs()) {
+                val info = if (lastResult.isNotEmpty()) " [Terakhir: $lastResult]" else " [Tidak ada respon dari halaman]"
+                handleAttemptError("Timeout pada tahap ${step.name}.$info")
                 return
             }
-            if (System.currentTimeMillis() - stepStartMs > 25000L) {
-                handleAttemptError("Timeout menunggu form terbuka (Koneksi lambat atau link tidak merespon).")
+
+            // Jika callback sebelumnya hilang (karena navigasi), kirim ulang setelah 1.5 detik
+            if (evalPending && now - evalSentAt < 1500L) {
+                scheduleTick(250)
                 return
             }
 
-            val escapedNama = JSONObject.quote(namaIdentitas)
-            val escapedPosisi = JSONObject.quote(posisiIdentitas)
+            val js = when (step) {
+                Step.PAGE1 -> buildJsPage1()
+                Step.NEXT -> JS_CLICK_NEXT
+                Step.PAGE2 -> buildJsPage2()
+                Step.CONFIRM -> JS_CHECK_DONE
+            }
 
-            val jsLayer1 = """
-                (function() {
-                    function byXPath(xp) {
-                        try {
-                            return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                        } catch(e) { return null; }
-                    }
-                    function setInputValue(el, val) {
-                        if (!el) return;
-                        el.focus();
-                        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                        if (setter) { setter.call(el, val); } else { el.value = val; }
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                        el.dispatchEvent(new Event('blur', { bubbles: true }));
-                    }
-                    function fullClick(el) {
-                        if (!el) return;
-                        ['mousedown', 'mouseup', 'click'].forEach(function(evtType) {
-                            try {
-                                el.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
-                            } catch(e) { el.click(); }
-                        });
-                    }
+            evalPending = true
+            evalSentAt = now
+            val gen = evalGeneration
+            val stepAtSend = step
 
-                    var inputs = document.querySelectorAll('input[type="text"], input:not([type])');
-                    var inpNama = inputs.length > 0 ? inputs[0] : byXPath('(//input[@type="text"])[1]');
-                    var ddPosisi = document.querySelector('div[role="listbox"]') || byXPath("(//div[@role='listbox'])[1]");
+            try {
+                webView.evaluateJavascript(js) { raw ->
+                    if (gen != evalGeneration || stepAtSend != step || !active) return@evaluateJavascript
+                    evalPending = false
+                    val res = (raw ?: "").trim().trim('"')
+                    lastResult = res
+                    handleResult(stepAtSend, res)
+                }
+            } catch (e: Exception) {
+                evalPending = false
+            }
 
-                    if (!inpNama || !ddPosisi) {
-                        return 'WAIT_PAGE1';
-                    }
+            scheduleTick(300)
+        }
 
-                    if (inpNama.value !== $escapedNama) {
-                        setInputValue(inpNama, $escapedNama);
-                    }
-
-                    // Cari opsi posisi di dropdown
-                    var optPosisi = byXPath("//div[@role='option']//span[text()=" + $escapedPosisi + "]") ||
-                                    byXPath("//div[@role='option'][contains(., " + $escapedPosisi + ")]");
-
-                    if (!optPosisi) {
-                        fullClick(ddPosisi);
-                        return 'OPENING_DROPDOWN';
-                    }
-
-                    var optContainer = optPosisi.closest("div[role='option']") || optPosisi;
-                    fullClick(optContainer);
-                    return 'POSISI_CLICKED';
-                })();
-            """.trimIndent()
-
-            webView.evaluateJavascript(jsLayer1) { rawRes ->
-                val res = rawRes?.trim('"', ' ') ?: ""
-                when (res) {
-                    "POSISI_CLICKED" -> {
-                        onLog("${wPrefix}Identitas PIC ($namaIdentitas - $posisiIdentitas) terisi. Lanjut ke halaman 2...", "INFO")
-                        mainHandler.postDelayed({ clickNextButton(System.currentTimeMillis()) }, 200)
-                    }
-                    "OPENING_DROPDOWN" -> {
-                        mainHandler.postDelayed({ waitForLayer1AndFill(stepStartMs) }, 200)
-                    }
-                    else -> {
-                        mainHandler.postDelayed({ waitForLayer1AndFill(stepStartMs) }, 180)
-                    }
+        private fun handleResult(s: Step, res: String) {
+            when (s) {
+                Step.PAGE1 -> if (res == "POSISI_OK") {
+                    onLog("${wPrefix}Identitas PIC ($namaIdentitas - $posisiIdentitas) terisi.", "INFO")
+                    goTo(Step.NEXT)
+                    scheduleTick(250)
+                }
+                Step.NEXT -> if (res == "CLICKED_NEXT") {
+                    onLog("${wPrefix}Klik 'Berikutnya' -> menuju halaman data stok...", "INFO")
+                    onProgressChange(completedCount.get() * 2 + 1, targetIndices.size * 2)
+                    goTo(Step.PAGE2)
+                    scheduleTick(600)
+                }
+                Step.PAGE2 -> if (res == "SUBMITTED") {
+                    onLog("${wPrefix}4 kolom stok terisi. Mengirim formulir...", "INFO")
+                    goTo(Step.CONFIRM)
+                    scheduleTick(600)
+                }
+                Step.CONFIRM -> when (res) {
+                    "DONE_AGAIN" -> { needInitialLoad = false; markRowSuccess() }
+                    "DONE" -> { needInitialLoad = true; markRowSuccess() }
                 }
             }
         }
 
-        private fun clickNextButton(stepStartMs: Long) {
-            if (isStopped.get()) {
-                onWorkerDone()
-                return
-            }
-            if (System.currentTimeMillis() - stepStartMs > 12000L) {
-                handleAttemptError("Timeout menekan tombol Berikutnya.")
-                return
-            }
-
-            val jsClickNext = """
+        private fun buildJsPage1(): String {
+            val nama = JSONObject.quote(namaIdentitas)
+            val posisi = JSONObject.quote(posisiIdentitas)
+            return """
                 (function() {
-                    function byXPath(xp) {
-                        try {
-                            return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                        } catch(e) { return null; }
-                    }
-                    function fullClick(el) {
-                        if (!el) return;
-                        ['mousedown', 'mouseup', 'click'].forEach(function(evtType) {
-                            try {
-                                el.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
-                            } catch(e) { el.click(); }
-                        });
-                    }
+                    try {
+                        $JS_HELPERS
+                        var inputs = visibleTextInputs();
+                        var dd = document.querySelector('div[role="listbox"]');
+                        if (inputs.length < 1 || !dd) return 'WAIT_PAGE1|' + document.title + '|in=' + inputs.length;
 
-                    var spanNext = byXPath("//span[text()='Berikutnya' or text()='Next']") ||
-                                   byXPath("//div[@role='button']//span[contains(text(),'Berikutnya') or contains(text(),'Next')]");
-                    if (!spanNext) return 'WAIT';
-                    var btn = spanNext.closest("div[role='button']") || spanNext;
-                    fullClick(btn);
-                    return 'CLICKED_NEXT';
+                        var target = $nama;
+                        if (inputs[0].value !== target) setVal(inputs[0], target);
+
+                        var want = $posisi;
+                        // Sudah terpilih?
+                        var sel = dd.querySelector('div[role="option"][aria-selected="true"]');
+                        if (sel && (sel.getAttribute('data-value') === want || (sel.innerText || '').trim() === want)) {
+                            return 'POSISI_OK';
+                        }
+
+                        var expanded = dd.getAttribute('aria-expanded') === 'true';
+                        if (!expanded) { clickEl(dd); return 'OPEN_DD'; }
+
+                        var opts = document.querySelectorAll('div[role="option"]');
+                        for (var i = 0; i < opts.length; i++) {
+                            var o = opts[i];
+                            var dv = o.getAttribute('data-value');
+                            var tx = (o.innerText || '').trim();
+                            if ((dv === want || tx === want) && isVis(o)) { clickEl(o); return 'PICK_OPT'; }
+                        }
+                        return 'WAIT_OPT|n=' + opts.length;
+                    } catch (e) { return 'ERR|' + e.message; }
                 })();
             """.trimIndent()
-
-            webView.evaluateJavascript(jsClickNext) { rawRes ->
-                val res = rawRes?.trim('"', ' ') ?: ""
-                if (res == "CLICKED_NEXT") {
-                    val doneSoFar = completedCount.get()
-                    onProgressChange(doneSoFar * 2 + 1, targetIndices.size * 2)
-                    mainHandler.postDelayed({ waitForLayer2AndSubmit(System.currentTimeMillis()) }, 250)
-                } else {
-                    mainHandler.postDelayed({ clickNextButton(stepStartMs) }, 180)
-                }
-            }
         }
 
-        private fun waitForLayer2AndSubmit(stepStartMs: Long) {
-            if (isStopped.get()) {
-                onWorkerDone()
-                return
-            }
-            if (System.currentTimeMillis() - stepStartMs > 25000L) {
-                handleAttemptError("Timeout menunggu halaman 2 (4 Kolom Stok) muncul.")
-                return
-            }
-
+        private fun buildJsPage2(): String {
             val row = rows[currentIndex]
             val vKeep = JSONObject.quote(DataValidator.bersihkanAngka(row.keepStock))
             val vSku = JSONObject.quote(DataValidator.bersihkanAngka(row.sku))
             val vQty = JSONObject.quote(DataValidator.bersihkanAngka(row.skuQty))
             val vGon = JSONObject.quote(DataValidator.bersihkanAngka(row.gondola))
-
-            val jsLayer2 = """
+            return """
                 (function() {
-                    function byXPath(xp) {
-                        try {
-                            return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                        } catch(e) { return null; }
-                    }
-                    function setInputValue(el, val) {
-                        if (!el) return;
-                        el.focus();
-                        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                        if (setter) { setter.call(el, val); } else { el.value = val; }
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                        el.dispatchEvent(new Event('blur', { bubbles: true }));
-                    }
-                    function fullClick(el) {
-                        if (!el) return;
-                        ['mousedown', 'mouseup', 'click'].forEach(function(evtType) {
-                            try {
-                                el.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
-                            } catch(e) { el.click(); }
-                        });
-                    }
-
-                    var inputs = document.querySelectorAll('input[type="text"], input:not([type])');
-                    var spanKirim = byXPath("//span[text()='Kirim' or text()='Submit']") ||
-                                    byXPath("//div[@role='button']//span[contains(text(),'Kirim') or contains(text(),'Submit')]");
-
-                    if (inputs.length < 4 || !spanKirim) {
-                        return 'WAIT_PAGE2';
-                    }
-
-                    setInputValue(inputs[0], $vKeep);
-                    setInputValue(inputs[1], $vSku);
-                    setInputValue(inputs[2], $vQty);
-                    setInputValue(inputs[3], $vGon);
-
-                    var btnSubmit = spanKirim.closest("div[role='button']") || spanKirim;
-                    fullClick(btnSubmit);
-                    return 'SUBMITTED';
+                    try {
+                        $JS_HELPERS
+                        var inputs = visibleTextInputs();
+                        var btn = findButton(['Kirim', 'Submit']);
+                        if (inputs.length < 4 || !btn) return 'WAIT_PAGE2|in=' + inputs.length + '|btn=' + (!!btn);
+                        setVal(inputs[0], $vKeep);
+                        setVal(inputs[1], $vSku);
+                        setVal(inputs[2], $vQty);
+                        setVal(inputs[3], $vGon);
+                        if (inputs[0].value !== $vKeep || inputs[3].value !== $vGon) return 'FILLING';
+                        clickEl(btn);
+                        return 'SUBMITTED';
+                    } catch (e) { return 'ERR|' + e.message; }
                 })();
             """.trimIndent()
-
-            webView.evaluateJavascript(jsLayer2) { rawRes ->
-                val res = rawRes?.trim('"', ' ') ?: ""
-                if (res == "SUBMITTED") {
-                    onLog("${wPrefix}Data stok terisi (SKU: ${DataValidator.bersihkanAngka(row.sku)}). Mengirim formulir...", "INFO")
-                    mainHandler.postDelayed({ waitForSubmitConfirm(System.currentTimeMillis()) }, 250)
-                } else {
-                    mainHandler.postDelayed({ waitForLayer2AndSubmit(stepStartMs) }, 180)
-                }
-            }
-        }
-
-        private fun waitForSubmitConfirm(stepStartMs: Long) {
-            if (isStopped.get()) {
-                onWorkerDone()
-                return
-            }
-            if (System.currentTimeMillis() - stepStartMs > 25000L) {
-                handleAttemptError("Timeout menunggu konfirmasi pengiriman form.")
-                return
-            }
-
-            val jsCheckDone = """
-                (function() {
-                    function byXPath(xp) {
-                        try {
-                            return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                        } catch(e) { return null; }
-                    }
-                    var linkAgain = byXPath("//a[contains(@href, 'viewform') or contains(@href, 'form_confirm') or contains(@href, 'formResponse')]");
-                    if (linkAgain) {
-                        linkAgain.click();
-                        return 'DONE_CLICKED_AGAIN';
-                    }
-                    var bodyText = document.body ? document.body.innerText : '';
-                    if (bodyText.indexOf('Jawaban Anda telah direkam') !== -1 ||
-                        bodyText.indexOf('telah direkam') !== -1 ||
-                        bodyText.indexOf('response has been recorded') !== -1) {
-                        return 'DONE_CONFIRMED';
-                    }
-                    var spanKirim = byXPath("//span[text()='Kirim' or text()='Submit']");
-                    if (!spanKirim && bodyText.length > 50) {
-                        return 'DONE_NO_SUBMIT_BTN';
-                    }
-                    return 'WAIT_CONFIRM';
-                })();
-            """.trimIndent()
-
-            webView.evaluateJavascript(jsCheckDone) { rawRes ->
-                val res = rawRes?.trim('"', ' ') ?: ""
-                when {
-                    res == "DONE_CLICKED_AGAIN" -> {
-                        needInitialLoad = false
-                        markRowSuccess()
-                    }
-                    res == "DONE_CONFIRMED" || res == "DONE_NO_SUBMIT_BTN" -> {
-                        needInitialLoad = true
-                        markRowSuccess()
-                    }
-                    else -> {
-                        mainHandler.postDelayed({ waitForSubmitConfirm(stepStartMs) }, 200)
-                    }
-                }
-            }
         }
 
         private fun markRowSuccess() {
+            active = false
+            mainHandler.removeCallbacks(tickRunnable)
+
             val durSec = (System.currentTimeMillis() - rowStartMs) / 1000.0
             val durStr = String.format("%.1fs", durSec)
-
-            val totalSucc = successCount.incrementAndGet()
+            successCount.incrementAndGet()
             val doneNow = completedCount.incrementAndGet()
 
             var prevLast = lastSuccessRow.get()
@@ -520,50 +440,121 @@ class GoogleFormAutomationCoordinator(
             onProgressChange(doneNow * 2, targetIndices.size * 2)
 
             val elapsedSec = maxOf(0.1, (System.currentTimeMillis() - sessionStartMs) / 1000.0)
-            val avgPerRow = elapsedSec / doneNow
-            val remainingRows = maxOf(0, targetIndices.size - doneNow)
-            val etaSec = (remainingRows * avgPerRow).toInt()
-            val etaFormatted = if (etaSec >= 60) {
-                "${etaSec / 60}m ${etaSec % 60}d"
-            } else {
-                "$etaSec detik"
-            }
-
-            onEtaChange("Selesai: $doneNow/${targetIndices.size} | Sisa waktu: ± $etaFormatted")
+            val etaSec = (maxOf(0, targetIndices.size - doneNow) * (elapsedSec / doneNow)).toInt()
+            val etaFmt = if (etaSec >= 60) "${etaSec / 60}m ${etaSec % 60}d" else "$etaSec detik"
+            onEtaChange("Selesai: $doneNow/${targetIndices.size} | Sisa waktu: ± $etaFmt")
 
             val row = rows[currentIndex]
             onLog(
-                "${wPrefix}Baris $currentRowNumber/${rows.size} SUKSES -> SKU: ${DataValidator.bersihkanAngka(row.sku)} | QTY: ${DataValidator.bersihkanAngka(row.skuQty)} ($durStr)",
+                "${wPrefix}Baris $currentRowNumber SUKSES -> SKU: ${DataValidator.bersihkanAngka(row.sku)} | QTY: ${DataValidator.bersihkanAngka(row.skuQty)} ($durStr)",
                 "SUKSES"
             )
-
-            mainHandler.postDelayed({ processNextRow() }, 100)
+            mainHandler.postDelayed({ processNextRow() }, 150)
         }
 
         private fun handleAttemptError(reason: String) {
-            if (isStopped.get()) {
-                onWorkerDone()
-                return
-            }
+            active = false
+            mainHandler.removeCallbacks(tickRunnable)
+            if (isStopped.get()) { finishWorker(); return }
 
             onLog("${wPrefix}Gagal baris $currentRowNumber (Percobaan $currentAttempt/$maxRetry): $reason", "ERROR")
 
             if (currentAttempt < maxRetry) {
                 currentAttempt++
                 needInitialLoad = true
-                mainHandler.postDelayed({ startAttempt() }, 1000)
+                mainHandler.postDelayed({ startAttempt() }, 1200)
             } else {
                 val doneNow = completedCount.incrementAndGet()
                 failedRows.add(currentIndex)
                 onRowStatusChange(currentIndex, "✗ Gagal (${maxRetry}x)", false)
                 onProgressChange(doneNow * 2, targetIndices.size * 2)
-                onLog(
-                    "${wPrefix}Baris $currentRowNumber DILEWATI setelah gagal $maxRetry kali. Lanjut ke baris berikutnya...",
-                    "WARN"
-                )
+                onLog("${wPrefix}Baris $currentRowNumber DILEWATI setelah gagal $maxRetry kali.", "WARN")
                 needInitialLoad = true
-                mainHandler.postDelayed({ processNextRow() }, 200)
+                mainHandler.postDelayed({ processNextRow() }, 300)
             }
         }
+    }
+
+    companion object {
+        // Fungsi bantu JS yang disisipkan ke setiap skrip
+        private const val JS_HELPERS = """
+            function isVis(el) {
+                if (!el) return false;
+                var r = el.getBoundingClientRect();
+                var st = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+            }
+            function visibleTextInputs() {
+                var all = document.querySelectorAll('input[type="text"], input[type="number"], input:not([type]), textarea');
+                var out = [];
+                for (var i = 0; i < all.length; i++) {
+                    var t = (all[i].getAttribute('type') || '').toLowerCase();
+                    if (t === 'hidden') continue;
+                    if (isVis(all[i])) out.push(all[i]);
+                }
+                return out;
+            }
+            function setVal(el, val) {
+                el.focus();
+                var proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+                var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+            }
+            function clickEl(el) {
+                if (!el) return;
+                try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+                var r = el.getBoundingClientRect();
+                var opts = { bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+                ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(t) {
+                    try {
+                        var ev = (t.indexOf('pointer') === 0 && window.PointerEvent) ? new PointerEvent(t, opts) : new MouseEvent(t, opts);
+                        el.dispatchEvent(ev);
+                    } catch (e) {}
+                });
+            }
+            function findButton(labels) {
+                var btns = document.querySelectorAll('div[role="button"], span, button');
+                for (var i = 0; i < btns.length; i++) {
+                    var tx = (btns[i].innerText || btns[i].textContent || '').trim();
+                    for (var j = 0; j < labels.length; j++) {
+                        if (tx === labels[j]) {
+                            var b = btns[i].closest('div[role="button"]') || btns[i];
+                            if (isVis(b)) return b;
+                        }
+                    }
+                }
+                return null;
+            }
+        """
+
+        private val JS_CLICK_NEXT = """
+            (function() {
+                try {
+                    $JS_HELPERS
+                    var btn = findButton(['Berikutnya', 'Next']);
+                    if (!btn) return 'WAIT_NEXT';
+                    clickEl(btn);
+                    return 'CLICKED_NEXT';
+                } catch (e) { return 'ERR|' + e.message; }
+            })();
+        """.trimIndent()
+
+        private val JS_CHECK_DONE = """
+            (function() {
+                try {
+                    var body = document.body ? (document.body.innerText || '') : '';
+                    var done = body.indexOf('telah direkam') !== -1 ||
+                               body.indexOf('has been recorded') !== -1 ||
+                               location.href.indexOf('formResponse') !== -1;
+                    if (!done) return 'WAIT_CONFIRM';
+                    var links = document.querySelectorAll('a[href*="viewform"]');
+                    if (links.length > 0) { links[0].click(); return 'DONE_AGAIN'; }
+                    return 'DONE';
+                } catch (e) { return 'ERR|' + e.message; }
+            })();
+        """.trimIndent()
     }
 }
