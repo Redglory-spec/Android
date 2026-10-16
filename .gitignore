@@ -1,0 +1,13 @@
+# Binaries & build artifacts
+*.exe
+*.obj
+*.res
+*.log
+.vs/
+.idea/
+.gradle/
+build/
+app/build/
+local.properties
+dist/
+dist-apk/

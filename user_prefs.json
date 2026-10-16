@@ -1,0 +1,11 @@
+{
+    "toko": "XPHD",
+    "jenis": "OUT",
+    "nama": "Kamrani",
+    "posisi": "AMP",
+    "headless": true,
+    "mode_sumber": "paste",
+    "jumlah_worker": 4,
+    "max_retry": 3,
+    "dark_mode": false
+}
