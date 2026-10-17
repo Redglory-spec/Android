@@ -337,10 +337,15 @@ class GoogleFormAutomationCoordinator(
 
         private fun handleResult(s: Step, res: String) {
             when (s) {
-                Step.PAGE1 -> if (res == "POSISI_OK") {
-                    onLog("${wPrefix}Identitas PIC ($namaIdentitas - $posisiIdentitas) terisi.", "INFO")
-                    goTo(Step.NEXT)
-                    scheduleTick(250)
+                Step.PAGE1 -> when {
+                    res == "POSISI_OK" -> {
+                        onLog("${wPrefix}Identitas PIC ($namaIdentitas - $posisiIdentitas) terisi.", "INFO")
+                        goTo(Step.NEXT)
+                        scheduleTick(250)
+                    }
+                    res.startsWith("OPEN_TRY") || res.startsWith("PICK_TRY") || res.startsWith("ERR") -> {
+                        onLog("${wPrefix}Diagnosa Posisi: $res", "WARN")
+                    }
                 }
                 Step.NEXT -> if (res == "CLICKED_NEXT") {
                     onLog("${wPrefix}Klik 'Berikutnya' -> menuju halaman data stok...", "INFO")
@@ -375,23 +380,55 @@ class GoogleFormAutomationCoordinator(
                         if (inputs[0].value !== target) setVal(inputs[0], target);
 
                         var want = $posisi;
-                        // Sudah terpilih?
+                        var st = window.__ks || (window.__ks = { openTry: 0, pickTry: 0, last: 0 });
+                        var now = Date.now();
+
+                        // 1. Sudah terpilih dengan benar?
                         var sel = dd.querySelector('div[role="option"][aria-selected="true"]');
-                        if (sel && (sel.getAttribute('data-value') === want || (sel.innerText || '').trim() === want)) {
-                            return 'POSISI_OK';
+                        var selVal = sel ? (sel.getAttribute('data-value') || (sel.innerText || '').trim()) : '';
+                        if (selVal === want) return 'POSISI_OK';
+
+                        // 2. Deteksi dropdown terbuka: aria-expanded ATAU ada >1 opsi yang terlihat
+                        var opts = document.querySelectorAll('div[role="option"]');
+                        var visOpts = [];
+                        for (var i = 0; i < opts.length; i++) { if (isVis(opts[i])) visOpts.push(opts[i]); }
+                        var expanded = dd.getAttribute('aria-expanded') === 'true' || visOpts.length > 1;
+                        var diag = '|exp=' + dd.getAttribute('aria-expanded') + '|vis=' + visOpts.length + '|sel=' + (selVal || '-');
+
+                        // Beri jeda 700ms antar aksi agar animasi/JS Google sempat merespon
+                        if (now - st.last < 700) return 'WAIT_ANIM' + diag;
+
+                        if (!expanded) {
+                            // Rotasi metode pembukaan dropdown (satu metode per percobaan)
+                            var m = st.openTry % 4;
+                            var name = '';
+                            if (m === 0) { fire(dd, ['mousedown']); name = 'mousedown'; }
+                            else if (m === 1) { fire(dd, ['mouseup']); name = 'mouseup'; }
+                            else if (m === 2) { fire(dd, ['click']); name = 'click'; }
+                            else { touch(dd); name = 'touch'; }
+                            st.openTry++;
+                            st.last = now;
+                            return 'OPEN_TRY|' + name + '#' + st.openTry + diag;
                         }
 
-                        var expanded = dd.getAttribute('aria-expanded') === 'true';
-                        if (!expanded) { clickEl(dd); return 'OPEN_DD'; }
-
-                        var opts = document.querySelectorAll('div[role="option"]');
-                        for (var i = 0; i < opts.length; i++) {
-                            var o = opts[i];
+                        // 3. Dropdown terbuka -> pilih opsi yang cocok di antara opsi yang terlihat
+                        var opt = null;
+                        for (var j = 0; j < visOpts.length; j++) {
+                            var o = visOpts[j];
                             var dv = o.getAttribute('data-value');
                             var tx = (o.innerText || '').trim();
-                            if ((dv === want || tx === want) && isVis(o)) { clickEl(o); return 'PICK_OPT'; }
+                            if (dv === want || tx === want) { opt = o; break; }
                         }
-                        return 'WAIT_OPT|n=' + opts.length;
+                        if (!opt) return 'WAIT_OPT' + diag;
+
+                        var p = st.pickTry % 3;
+                        var pname = '';
+                        if (p === 0) { fire(opt, ['mousedown', 'mouseup']); pname = 'down+up'; }
+                        else if (p === 1) { fire(opt, ['click']); pname = 'click'; }
+                        else { touch(opt); pname = 'touch'; }
+                        st.pickTry++;
+                        st.last = now;
+                        return 'PICK_TRY|' + pname + '#' + st.pickTry + diag;
                     } catch (e) { return 'ERR|' + e.message; }
                 })();
             """.trimIndent()
@@ -514,6 +551,28 @@ class GoogleFormAutomationCoordinator(
                         el.dispatchEvent(ev);
                     } catch (e) {}
                 });
+            }
+            function fire(el, types) {
+                if (!el) return;
+                try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+                var r = el.getBoundingClientRect();
+                var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                types.forEach(function(t) {
+                    try {
+                        el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window, button: 0, buttons: (t === 'mousedown' ? 1 : 0), clientX: cx, clientY: cy }));
+                    } catch (e) {}
+                });
+            }
+            function touch(el) {
+                if (!el) return;
+                try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+                var r = el.getBoundingClientRect();
+                var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                try {
+                    var tp = new Touch({ identifier: Date.now(), target: el, clientX: cx, clientY: cy });
+                    el.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, cancelable: true, touches: [tp], targetTouches: [tp], changedTouches: [tp] }));
+                    el.dispatchEvent(new TouchEvent('touchend', { bubbles: true, cancelable: true, touches: [], targetTouches: [], changedTouches: [tp] }));
+                } catch (e) {}
             }
             function findButton(labels) {
                 var btns = document.querySelectorAll('div[role="button"], span, button');
