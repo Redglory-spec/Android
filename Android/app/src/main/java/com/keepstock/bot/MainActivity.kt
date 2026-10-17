@@ -73,7 +73,7 @@ class MainActivity : Activity() {
     private lateinit var tvStatus: TextView
     private lateinit var tvEta: TextView
     private lateinit var progressBar: ProgressBar
-    private lateinit var webViewWrapper: LinearLayout
+    private lateinit var webViewWrapper: ScrollView
     private lateinit var webViewContainer: LinearLayout
 
     // Tombol Kontrol Utama
@@ -533,14 +533,21 @@ class MainActivity : Activity() {
         card3.addView(tvEta)
         card3.addView(progressBar)
 
-        // Wadah WebView Live (Tetap aktif ter-render di memori meskipun Headless)
-        webViewWrapper = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        // Wadah WebView Live (ScrollView memastikan WebView tetap berukuran penuh 320dp di memori meskipun tinggi wadah luar 1dp saat Headless)
+        webViewWrapper = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(1)
             )
             alpha = 0.01f
+            isVerticalScrollBarEnabled = false
+        }
+        val webViewInnerBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
         }
         val tvWebPreviewTitle = createSmallLabel("🌐 Tampilan Live Google Form (WebView):")
         webViewContainer = LinearLayout(this).apply {
@@ -550,8 +557,9 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
         }
-        webViewWrapper.addView(tvWebPreviewTitle)
-        webViewWrapper.addView(webViewContainer)
+        webViewInnerBox.addView(tvWebPreviewTitle)
+        webViewInnerBox.addView(webViewContainer)
+        webViewWrapper.addView(webViewInnerBox)
         card3.addView(webViewWrapper)
 
         bodyContainer.addView(card3)

@@ -343,7 +343,7 @@ class GoogleFormAutomationCoordinator(
                         goTo(Step.NEXT)
                         scheduleTick(250)
                     }
-                    res.startsWith("OPEN_TRY") || res.startsWith("PICK_TRY") || res.startsWith("ERR") -> {
+                    res.startsWith("ERR") -> {
                         onLog("${wPrefix}Diagnosa Posisi: $res", "WARN")
                     }
                 }
@@ -374,61 +374,48 @@ class GoogleFormAutomationCoordinator(
                         $JS_HELPERS
                         var inputs = visibleTextInputs();
                         var dd = document.querySelector('div[role="listbox"]');
-                        if (inputs.length < 1 || !dd) return 'WAIT_PAGE1|' + document.title + '|in=' + inputs.length;
+                        if (inputs.length < 1 || !dd) return 'WAIT_PAGE1|in=' + inputs.length;
 
                         var target = $nama;
                         if (inputs[0].value !== target) setVal(inputs[0], target);
 
-                        var want = $posisi;
-                        var st = window.__ks || (window.__ks = { openTry: 0, pickTry: 0, last: 0 });
-                        var now = Date.now();
-
-                        // 1. Sudah terpilih dengan benar?
-                        var sel = dd.querySelector('div[role="option"][aria-selected="true"]');
+                        var want = ($posisi || '').toUpperCase();
+                        var headerBox = dd.querySelector('[jsname="d9BH4c"]') || dd.querySelector('[jsname="LgbsSe"]');
+                        var sel = headerBox ? headerBox.querySelector('div[role="option"][aria-selected="true"]')
+                                            : dd.querySelector('div[role="option"][aria-selected="true"]');
                         var selVal = sel ? (sel.getAttribute('data-value') || (sel.innerText || '').trim()) : '';
-                        if (selVal === want) return 'POSISI_OK';
+                        if (selVal.toUpperCase() === want) return 'POSISI_OK';
 
-                        // 2. Deteksi dropdown terbuka: aria-expanded ATAU ada >1 opsi yang terlihat
-                        var opts = document.querySelectorAll('div[role="option"]');
-                        var visOpts = [];
-                        for (var i = 0; i < opts.length; i++) { if (isVis(opts[i])) visOpts.push(opts[i]); }
-                        var expanded = dd.getAttribute('aria-expanded') === 'true' || visOpts.length > 1;
-                        var diag = '|exp=' + dd.getAttribute('aria-expanded') + '|vis=' + visOpts.length + '|sel=' + (selVal || '-');
-
-                        // Beri jeda 700ms antar aksi agar animasi/JS Google sempat merespon
-                        if (now - st.last < 700) return 'WAIT_ANIM' + diag;
-
-                        if (!expanded) {
-                            // Rotasi metode pembukaan dropdown (satu metode per percobaan)
-                            var m = st.openTry % 4;
-                            var name = '';
-                            if (m === 0) { fire(dd, ['mousedown']); name = 'mousedown'; }
-                            else if (m === 1) { fire(dd, ['mouseup']); name = 'mouseup'; }
-                            else if (m === 2) { fire(dd, ['click']); name = 'click'; }
-                            else { touch(dd); name = 'touch'; }
-                            st.openTry++;
-                            st.last = now;
-                            return 'OPEN_TRY|' + name + '#' + st.openTry + diag;
+                        // Cari opsi di dalam kontainer popup Google Closure [jsname="V68bde"]
+                        var popup = dd.querySelector('[jsname="V68bde"]') || document;
+                        var popupOpts = popup.querySelectorAll('div[role="option"][jsname="wQNmvb"], div[role="option"]');
+                        var targetOpt = null;
+                        var visPopupCount = 0;
+                        for (var i = 0; i < popupOpts.length; i++) {
+                            var o = popupOpts[i];
+                            if (headerBox && headerBox.contains(o)) continue;
+                            var r = o.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) {
+                                visPopupCount++;
+                                var dv = (o.getAttribute('data-value') || (o.innerText || '').trim()).toUpperCase();
+                                if (dv === want) targetOpt = o;
+                            }
                         }
 
-                        // 3. Dropdown terbuka -> pilih opsi yang cocok di antara opsi yang terlihat
-                        var opt = null;
-                        for (var j = 0; j < visOpts.length; j++) {
-                            var o = visOpts[j];
-                            var dv = o.getAttribute('data-value');
-                            var tx = (o.innerText || '').trim();
-                            if (dv === want || tx === want) { opt = o; break; }
+                        var isExpanded = (dd.getAttribute('aria-expanded') === 'true') || (visPopupCount > 0);
+                        if (!isExpanded) {
+                            // Wajib klik [jsname="LgbsSe"] sesuai jsaction="click:cOuCgd(LgbsSe)"
+                            var trigger = dd.querySelector('[jsname="LgbsSe"]') || dd;
+                            tapEl(trigger);
+                            return 'OPENING_DD|exp=' + dd.getAttribute('aria-expanded') + '|vis=' + visPopupCount;
                         }
-                        if (!opt) return 'WAIT_OPT' + diag;
 
-                        var p = st.pickTry % 3;
-                        var pname = '';
-                        if (p === 0) { fire(opt, ['mousedown', 'mouseup']); pname = 'down+up'; }
-                        else if (p === 1) { fire(opt, ['click']); pname = 'click'; }
-                        else { touch(opt); pname = 'touch'; }
-                        st.pickTry++;
-                        st.last = now;
-                        return 'PICK_TRY|' + pname + '#' + st.pickTry + diag;
+                        if (targetOpt) {
+                            tapEl(targetOpt);
+                            return 'PICKED_OPT|' + want + '|vis=' + visPopupCount;
+                        }
+
+                        return 'WAIT_POPUP_OPTS|vis=' + visPopupCount;
                     } catch (e) { return 'ERR|' + e.message; }
                 })();
             """.trimIndent()
@@ -447,12 +434,12 @@ class GoogleFormAutomationCoordinator(
                         var inputs = visibleTextInputs();
                         var btn = findButton(['Kirim', 'Submit']);
                         if (inputs.length < 4 || !btn) return 'WAIT_PAGE2|in=' + inputs.length + '|btn=' + (!!btn);
-                        setVal(inputs[0], $vKeep);
-                        setVal(inputs[1], $vSku);
-                        setVal(inputs[2], $vQty);
-                        setVal(inputs[3], $vGon);
-                        if (inputs[0].value !== $vKeep || inputs[3].value !== $vGon) return 'FILLING';
-                        clickEl(btn);
+                        var vals = [$vKeep, $vSku, $vQty, $vGon];
+                        for (var i = 0; i < 4; i++) {
+                            if (inputs[i].value !== vals[i]) setVal(inputs[i], vals[i]);
+                        }
+                        if (inputs[0].value !== vals[0] || inputs[3].value !== vals[3]) return 'FILLING';
+                        tapEl(btn);
                         return 'SUBMITTED';
                     } catch (e) { return 'ERR|' + e.message; }
                 })();
@@ -513,7 +500,7 @@ class GoogleFormAutomationCoordinator(
     }
 
     companion object {
-        // Fungsi bantu JS yang disisipkan ke setiap skrip
+        // Fungsi bantu JS yang telah diverifikasi via simulasi lokal terhadap Google Closure Wiz
         private const val JS_HELPERS = """
             function isVis(el) {
                 if (!el) return false;
@@ -526,8 +513,8 @@ class GoogleFormAutomationCoordinator(
                 var out = [];
                 for (var i = 0; i < all.length; i++) {
                     var t = (all[i].getAttribute('type') || '').toLowerCase();
-                    if (t === 'hidden') continue;
-                    if (isVis(all[i])) out.push(all[i]);
+                    if (t === 'hidden' || t === 'checkbox' || t === 'radio') continue;
+                    if (all[i].offsetParent !== null || isVis(all[i])) out.push(all[i]);
                 }
                 return out;
             }
@@ -535,51 +522,30 @@ class GoogleFormAutomationCoordinator(
                 el.focus();
                 var proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
                 var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-                setter.call(el, val);
+                if (setter) setter.call(el, val);
+                else el.value = val;
                 el.dispatchEvent(new Event('input', { bubbles: true }));
                 el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.dispatchEvent(new Event('blur', { bubbles: true }));
+                el.blur();
             }
-            function clickEl(el) {
+            function tapEl(el) {
                 if (!el) return;
-                try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
                 var r = el.getBoundingClientRect();
-                var opts = { bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-                ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(t) {
-                    try {
-                        var ev = (t.indexOf('pointer') === 0 && window.PointerEvent) ? new PointerEvent(t, opts) : new MouseEvent(t, opts);
-                        el.dispatchEvent(ev);
-                    } catch (e) {}
+                var cx = r.left + (r.width > 0 ? r.width / 2 : 10);
+                var cy = r.top + (r.height > 0 ? r.height / 2 : 10);
+                ['mousedown', 'mouseup', 'click'].forEach(function(t) {
+                    el.dispatchEvent(new MouseEvent(t, {
+                        view: window, bubbles: true, cancelable: true,
+                        clientX: cx, clientY: cy, button: 0, buttons: 1
+                    }));
                 });
-            }
-            function fire(el, types) {
-                if (!el) return;
-                try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
-                var r = el.getBoundingClientRect();
-                var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-                types.forEach(function(t) {
-                    try {
-                        el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window, button: 0, buttons: (t === 'mousedown' ? 1 : 0), clientX: cx, clientY: cy }));
-                    } catch (e) {}
-                });
-            }
-            function touch(el) {
-                if (!el) return;
-                try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
-                var r = el.getBoundingClientRect();
-                var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-                try {
-                    var tp = new Touch({ identifier: Date.now(), target: el, clientX: cx, clientY: cy });
-                    el.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, cancelable: true, touches: [tp], targetTouches: [tp], changedTouches: [tp] }));
-                    el.dispatchEvent(new TouchEvent('touchend', { bubbles: true, cancelable: true, touches: [], targetTouches: [], changedTouches: [tp] }));
-                } catch (e) {}
             }
             function findButton(labels) {
-                var btns = document.querySelectorAll('div[role="button"], span, button');
+                var btns = document.querySelectorAll('div[role="button"], span[role="button"], button');
                 for (var i = 0; i < btns.length; i++) {
-                    var tx = (btns[i].innerText || btns[i].textContent || '').trim();
+                    var tx = (btns[i].innerText || btns[i].textContent || '').trim().toLowerCase();
                     for (var j = 0; j < labels.length; j++) {
-                        if (tx === labels[j]) {
+                        if (tx.indexOf(labels[j].toLowerCase()) !== -1) {
                             var b = btns[i].closest('div[role="button"]') || btns[i];
                             if (isVis(b)) return b;
                         }
@@ -595,7 +561,7 @@ class GoogleFormAutomationCoordinator(
                     $JS_HELPERS
                     var btn = findButton(['Berikutnya', 'Next']);
                     if (!btn) return 'WAIT_NEXT';
-                    clickEl(btn);
+                    tapEl(btn);
                     return 'CLICKED_NEXT';
                 } catch (e) { return 'ERR|' + e.message; }
             })();
